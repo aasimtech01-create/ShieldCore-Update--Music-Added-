@@ -1,0 +1,1599 @@
+import os
+import asyncio
+import discord
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
+import datetime
+import time
+import random
+import json
+import re
+from collections import defaultdict, deque
+
+# Load this bot's own settings and keep its data in this folder.
+BOT_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BOT_DIR, ".env"), override=True)
+SERVER_DATA_FILE = os.path.join(BOT_DIR, "server_data.json")
+BOT_CONFIG_FILE = os.path.join(BOT_DIR, "bot_backup.json")
+
+# Bot configuration
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix='!', intents=intents, help_command=None)
+
+# Configuration from .env
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+OWNER_ID = int(os.getenv('OWNER_ID', os.getenv('DEVELOPER_ID', '0')))
+
+# Anti-bot switch system
+ANTI_BOT_SYSTEM = True
+
+# Message rate-limit protection
+SPAM_CACHE = defaultdict(deque)
+FAST_MESSAGE_LIMIT = 5
+FAST_TIME_WINDOW = 3
+
+# Slow spam detection
+SLOW_MESSAGE_LIMIT = 15  # messages
+SLOW_TIME_WINDOW = 30
+SPAM_ACTION_COOLDOWN = 60
+SPAM_ACTIONS = {}
+SPAM_CACHE_MAX_ENTRIES = 10000
+SPAM_MESSAGE_COUNT = 0
+
+# Command rate limits are scoped per server and user.
+COMMAND_RATE_CACHE = defaultdict(deque)
+GUILD_COMMAND_RATE_CACHE = defaultdict(deque)
+COMMAND_RATE_LIMIT = 6
+COMMAND_RATE_WINDOW = 10
+GUILD_COMMAND_RATE_LIMIT = 60
+COMMAND_WARNING_COOLDOWNS = {}
+
+# English-language profanity filter. Matches whole words to reduce false positives.
+ABUSIVE_WORDS = [
+    "asshole", "bastard", "bitch", "bullshit", "cunt", "dick",
+    "fuck", "fucker", "fucking", "motherfucker", "piss", "pussy",
+    "shit", "slut", "whore"
+]
+ABUSIVE_WORD_PATTERN = re.compile(
+    r"(?<!\w)(?:" + "|".join(re.escape(word) for word in ABUSIVE_WORDS) + r")(?!\w)",
+    re.IGNORECASE,
+)
+
+# Anti-nuke system
+ACTION_CACHE = {}
+NUKE_LIMITS = {
+    'channel_create': 3,
+    'channel_delete': 3,
+    'role_create': 3,
+    'role_delete': 2,
+    'kick_members': 3,
+    'ban_members': 3
+}
+NUKE_ACTION_COOLDOWNS = {}
+
+# Local guild backup data
+GUILD_BACKUPS = {}
+
+# Server-specific data
+SERVER_WHITELISTS = {}
+SERVER_APPROVED_BOTS = {}
+SERVER_ANTI_BOT_SYSTEM = {}
+
+SECURITY_STATUSES = [
+    "Security monitoring active",
+    "Anti-nuke protection enabled",
+    "Anti-spam protection enabled",
+    "Server safety is our priority",
+    "ShieldCore Security is monitoring this server"
+]
+
+SIMPLE_DM_LINES = [
+    "Your message rate exceeded this server's limit. Please slow down.",
+    "Anti-spam protection detected excessive messages. Please wait before posting again."
+]
+
+BOT_KICK_DM_LINES = [
+    "This bot was removed because it is not on the server's approved-bot list. Contact a server administrator if this was a mistake.",
+]
+
+class SecuritySystem:
+    def __init__(self, bot):
+        self.bot = bot
+        self.deleted_channels = {}
+        self.deleted_roles = {}
+        self.last_audit_check = {}
+    
+    def is_owner(self, user_id):
+        return OWNER_ID != 0 and user_id == OWNER_ID
+    
+    def is_server_owner(self, user, guild):
+        return user.id == guild.owner_id
+    
+    def get_server_whitelist(self, guild_id):
+        return SERVER_WHITELISTS.get(str(guild_id), [])
+    
+    def add_to_server_whitelist(self, guild_id, user_id):
+        guild_id_str = str(guild_id)
+        if guild_id_str not in SERVER_WHITELISTS:
+            SERVER_WHITELISTS[guild_id_str] = []
+        
+        if user_id not in SERVER_WHITELISTS[guild_id_str]:
+            SERVER_WHITELISTS[guild_id_str].append(user_id)
+            self.save_server_data()
+            return True
+        return False
+    
+    def remove_from_server_whitelist(self, guild_id, user_id):
+        guild_id_str = str(guild_id)
+        if guild_id_str in SERVER_WHITELISTS and user_id in SERVER_WHITELISTS[guild_id_str]:
+            SERVER_WHITELISTS[guild_id_str].remove(user_id)
+            self.save_server_data()
+            return True
+        return False
+    
+    def get_server_approved_bots(self, guild_id):
+        return SERVER_APPROVED_BOTS.get(str(guild_id), [])
+    
+    def add_server_approved_bot(self, guild_id, bot_id):
+        guild_id_str = str(guild_id)
+        if guild_id_str not in SERVER_APPROVED_BOTS:
+            SERVER_APPROVED_BOTS[guild_id_str] = []
+        
+        if bot_id not in SERVER_APPROVED_BOTS[guild_id_str]:
+            SERVER_APPROVED_BOTS[guild_id_str].append(bot_id)
+            self.save_server_data()
+            return True
+        return False
+    
+    def get_server_anti_bot_status(self, guild_id):
+        return SERVER_ANTI_BOT_SYSTEM.get(str(guild_id), True)
+    
+    def set_server_anti_bot_status(self, guild_id, status):
+        SERVER_ANTI_BOT_SYSTEM[str(guild_id)] = status
+        self.save_server_data()
+    
+    def is_trusted_user(self, user_id, guild_id):
+        return (
+            user_id == OWNER_ID and OWNER_ID != 0
+        ) or user_id in self.get_server_whitelist(guild_id)
+    
+    def is_approved_bot(self, bot_id, guild_id):
+        return bot_id in self.get_server_approved_bots(guild_id)
+    
+    def save_server_data(self):
+        data = {
+            'server_whitelists': SERVER_WHITELISTS,
+            'server_approved_bots': SERVER_APPROVED_BOTS,
+            'server_anti_bot_system': SERVER_ANTI_BOT_SYSTEM,
+        }
+        try:
+            temporary_file = SERVER_DATA_FILE + ".tmp"
+            with open(temporary_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2)
+            os.replace(temporary_file, SERVER_DATA_FILE)
+        except OSError as error:
+            print(f"Could not save server data: {error}")
+    
+    def load_server_data(self):
+        try:
+            if os.path.exists(SERVER_DATA_FILE):
+                with open(SERVER_DATA_FILE, 'r') as f:
+                    data = json.load(f)
+                    global SERVER_WHITELISTS, SERVER_APPROVED_BOTS, SERVER_ANTI_BOT_SYSTEM
+                    if not isinstance(data, dict):
+                        raise TypeError("Server data must be a JSON object")
+                    SERVER_WHITELISTS = {
+                        str(guild_id): [int(user_id) for user_id in user_ids]
+                        for guild_id, user_ids in data.get('server_whitelists', {}).items()
+                    }
+                    SERVER_APPROVED_BOTS = {
+                        str(guild_id): [int(bot_id) for bot_id in bot_ids]
+                        for guild_id, bot_ids in data.get('server_approved_bots', {}).items()
+                    }
+                    SERVER_ANTI_BOT_SYSTEM = data.get('server_anti_bot_system', {})
+                    # Legacy global trust lists are intentionally ignored.
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError) as error:
+            print(f"Could not load server data: {error}")
+    
+    async def save_guild_backup(self, guild):
+        backup = {
+            'guild_id': guild.id,
+            'guild_name': guild.name,
+            'owner_id': guild.owner_id,
+            'channels': [],
+            'roles': [],
+            'permissions': {},
+            'created_at': datetime.datetime.now(datetime.UTC).isoformat()
+        }
+        
+        for channel in guild.channels:
+            channel_data = {
+                'name': channel.name,
+                'id': channel.id,
+                'type': channel.type.name,
+                'position': channel.position,
+                'category_id': channel.category_id,
+            }
+            if isinstance(channel, discord.TextChannel):
+                channel_data['topic'] = channel.topic
+            backup['channels'].append(channel_data)
+
+        backup['roles'] = [
+            {
+                'id': role.id,
+                'name': role.name,
+                'position': role.position,
+                'permissions': role.permissions.value,
+                'managed': role.managed,
+                'mentionable': role.mentionable,
+            }
+            for role in guild.roles
+            if not role.is_default()
+        ]
+        
+        bot_member = guild.get_member(self.bot.user.id)
+        if bot_member:
+            backup['permissions'] = {
+                'roles': [role.id for role in bot_member.roles],
+                'guild_permissions': dict(bot_member.guild_permissions)
+            }
+        
+        GUILD_BACKUPS[guild.id] = backup
+        await self.save_backup_to_file()
+    
+    async def save_backup_to_file(self):
+        try:
+            temporary_file = BOT_CONFIG_FILE + ".tmp"
+            with open(temporary_file, 'w', encoding='utf-8') as f:
+                json.dump(GUILD_BACKUPS, f, indent=2)
+            os.replace(temporary_file, BOT_CONFIG_FILE)
+        except OSError as error:
+            print(f"Could not save guild backup: {error}")
+    
+    async def load_backup_from_file(self):
+        try:
+            if os.path.exists(BOT_CONFIG_FILE):
+                with open(BOT_CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    return {int(guild_id): backup for guild_id, backup in data.items()}
+        except (OSError, json.JSONDecodeError, TypeError, ValueError, AttributeError) as error:
+            print(f"Could not load guild backup: {error}")
+        return {}
+    
+    def get_simple_dm(self):
+        return random.choice(SIMPLE_DM_LINES)
+    
+    def check_abusive_content(self, message_content):
+        """Check whether a message contains a listed English profanity term."""
+        match = ABUSIVE_WORD_PATTERN.search(message_content)
+        return (True, match.group(0)) if match else (False, None)
+
+security = SecuritySystem(bot)
+
+# PERMISSION CHECK FUNCTIONS
+def is_owner_only():
+    async def predicate(ctx):
+        if security.is_owner(ctx.author.id):
+            return True
+        await ctx.send("❌ This command is restricted to the bot owner.", delete_after=10)
+        return False
+    return commands.check(predicate)
+
+def is_server_owner_only():
+    async def predicate(ctx):
+        if ctx.guild and security.is_server_owner(ctx.author, ctx.guild):
+            return True
+        await ctx.send("❌ Only this server's owner can use this command.", delete_after=10)
+        return False
+    return commands.check(predicate)
+
+def has_admin_perms():
+    async def predicate(ctx):
+        if ctx.guild and ctx.author.guild_permissions.administrator:
+            return True
+        await ctx.send("❌ Administrator permission is required to use this command.", delete_after=10)
+        return False
+    return commands.check(predicate)
+
+def has_manage_messages_perm():
+    async def predicate(ctx):
+        if ctx.guild and ctx.author.guild_permissions.manage_messages:
+            return True
+        await ctx.send("❌ Manage Messages permission is required to use this command.", delete_after=10)
+        return False
+    return commands.check(predicate)
+
+
+@bot.check
+async def command_rate_limit(ctx):
+    """Limit command bursts per user and server to reduce API pressure."""
+    if OWNER_ID and ctx.author.id == OWNER_ID:
+        return True
+
+    now = time.monotonic()
+    guild_id = ctx.guild.id if ctx.guild else 0
+    key = (guild_id, ctx.author.id)
+    timestamps = COMMAND_RATE_CACHE[key]
+    guild_timestamps = GUILD_COMMAND_RATE_CACHE[guild_id]
+    while timestamps and now - timestamps[0] > COMMAND_RATE_WINDOW:
+        timestamps.popleft()
+    while guild_timestamps and now - guild_timestamps[0] > COMMAND_RATE_WINDOW:
+        guild_timestamps.popleft()
+
+    if len(timestamps) >= COMMAND_RATE_LIMIT or (
+        guild_id and len(guild_timestamps) >= GUILD_COMMAND_RATE_LIMIT
+    ):
+        if now - COMMAND_WARNING_COOLDOWNS.get(key, 0) >= 15:
+            COMMAND_WARNING_COOLDOWNS[key] = now
+            try:
+                await ctx.send(
+                    "Command rate limit reached. Please wait a few seconds before trying again.",
+                    delete_after=8,
+                )
+            except discord.HTTPException:
+                pass
+        return False
+
+    timestamps.append(now)
+    guild_timestamps.append(now)
+    if len(COMMAND_RATE_CACHE) > SPAM_CACHE_MAX_ENTRIES:
+        for cached_key, cached_timestamps in list(COMMAND_RATE_CACHE.items()):
+            if not cached_timestamps or now - cached_timestamps[-1] > COMMAND_RATE_WINDOW:
+                COMMAND_RATE_CACHE.pop(cached_key, None)
+                COMMAND_WARNING_COOLDOWNS.pop(cached_key, None)
+    if len(GUILD_COMMAND_RATE_CACHE) > SPAM_CACHE_MAX_ENTRIES:
+        for cached_guild_id, cached_timestamps in list(GUILD_COMMAND_RATE_CACHE.items()):
+            if not cached_timestamps or now - cached_timestamps[-1] > COMMAND_RATE_WINDOW:
+                GUILD_COMMAND_RATE_CACHE.pop(cached_guild_id, None)
+    return True
+
+
+@bot.event
+async def on_ready():
+    print(f'✅ {bot.user} has connected to Discord!')
+    print(f'📊 Connected to {len(bot.guilds)} guilds')
+    print(f'🛡️ Security System: ACTIVE')
+    print(f'🚫 Anti-Bot: {"ENABLED" if ANTI_BOT_SYSTEM else "DISABLED"}')
+    print(f'⚡ Anti-Nuke: ACTIVE')
+    print(f'📝 Anti-Spam: WORKING')
+    print(f'🔞 Abuse Filter: ACTIVE')
+    print(f'🎮 Slow Spam Detection: ENABLED')
+    
+    global GUILD_BACKUPS
+    GUILD_BACKUPS = await security.load_backup_from_file()
+    security.load_server_data()
+    
+    for guild in bot.guilds:
+        await security.save_guild_backup(guild)
+    
+    if not change_status.is_running():
+        change_status.start()
+    
+    print('✅ Security monitoring is ready.')
+
+@tasks.loop(seconds=30)
+async def change_status():
+    status = random.choice(SECURITY_STATUSES)
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name=status))
+
+def check_message_rate_limit(guild_id, user_id, current_time):
+    """Record a message and return the triggered limit, if any."""
+    global SPAM_MESSAGE_COUNT
+    key = (guild_id, user_id)
+    if SPAM_ACTIONS.get(key, 0) > current_time:
+        return "COOLDOWN"
+
+    timestamps = SPAM_CACHE[key]
+    timestamps.append(current_time)
+    while timestamps and current_time - timestamps[0] > SLOW_TIME_WINDOW:
+        timestamps.popleft()
+
+    SPAM_MESSAGE_COUNT += 1
+    if SPAM_MESSAGE_COUNT % 512 == 0 and len(SPAM_CACHE) > SPAM_CACHE_MAX_ENTRIES:
+        active_keys = set(SPAM_CACHE)
+        for cached_key in active_keys:
+            cached = SPAM_CACHE[cached_key]
+            if not cached or current_time - cached[-1] > SLOW_TIME_WINDOW:
+                SPAM_CACHE.pop(cached_key, None)
+                SPAM_ACTIONS.pop(cached_key, None)
+
+    if len(timestamps) >= FAST_MESSAGE_LIMIT and current_time - timestamps[-FAST_MESSAGE_LIMIT] <= FAST_TIME_WINDOW:
+        SPAM_ACTIONS[key] = current_time + SPAM_ACTION_COOLDOWN
+        timestamps.clear()
+        return "FAST"
+    if len(timestamps) >= SLOW_MESSAGE_LIMIT:
+        SPAM_ACTIONS[key] = current_time + SPAM_ACTION_COOLDOWN
+        timestamps.clear()
+        return "SLOW"
+    return None
+
+
+# Message spam and profanity protection
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        await bot.process_commands(message)
+        return
+    
+    user_id = message.author.id
+    current_time = time.monotonic()
+    
+    is_whitelisted = (
+        security.is_trusted_user(user_id, message.guild.id)
+        or security.is_server_owner(message.author, message.guild)
+    )
+    
+    # Profanity detection
+    is_abusive, abusive_word = security.check_abusive_content(message.content)
+    
+    if is_abusive and not is_whitelisted:
+        try:
+            await message.delete()
+        except Exception as e:
+            print(f"Could not remove a profanity-filtered message: {e}")
+
+        bot_member = message.guild.me
+        if bot_member and bot_member.guild_permissions.moderate_members:
+            try:
+                await message.author.timeout(
+                    datetime.timedelta(minutes=10),
+                    reason=f"Profanity filter triggered: {abusive_word}",
+                )
+                action = "Message removed; member timed out for 10 minutes."
+            except discord.HTTPException as error:
+                action = f"Message removed; timeout failed ({error})."
+        else:
+            action = "Message removed; the bot lacks Moderate Members permission."
+
+        try:
+            await message.channel.send(
+                f"{message.author.mention}, please keep the conversation respectful. {action}",
+                delete_after=10,
+                allowed_mentions=discord.AllowedMentions(users=False),
+            )
+        except discord.HTTPException:
+            pass
+        return
+
+    if not is_whitelisted:
+        limit_type = check_message_rate_limit(message.guild.id, user_id, current_time)
+        if limit_type == "COOLDOWN":
+            try:
+                await message.delete()
+            except discord.HTTPException:
+                pass
+            return
+        if limit_type:
+            await handle_spam(message, limit_type)
+            return
+
+    await bot.process_commands(message)
+
+async def handle_spam(message, spam_type):
+    """Apply a single moderation response to a message-rate violation."""
+    try:
+        bot_member = message.guild.me
+        user = message.author
+        
+        if spam_type == "FAST":
+            action_text = "Fast spam detected (5 messages in 3 seconds)"
+            timeout_minutes = 10
+        else:  # SLOW
+            action_text = "Slow spam detected (15 messages in 30 seconds)"
+            timeout_minutes = 15
+        
+        # Try to timeout first
+        if bot_member and bot_member.guild_permissions.moderate_members:
+            try:
+                timeout_duration = datetime.timedelta(minutes=timeout_minutes)
+                await user.timeout(timeout_duration, reason=f"Anti-spam: {spam_type.lower()} spam")
+                
+                # Send DM for spam
+                try:
+                    spam_dm = security.get_simple_dm()
+                    await user.send(spam_dm)
+                except:
+                    pass
+                
+            except:
+                pass
+        
+        # Try to delete spam messages
+        if bot_member and bot_member.guild_permissions.manage_messages:
+            try:
+                def is_user_spam(m):
+                    return m.author.id == user.id
+                
+                await message.channel.purge(limit=20, check=is_user_spam, before=message)
+            except discord.HTTPException:
+                pass
+
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
+        
+        # Send warning in channel
+        warning_embed = discord.Embed(
+            title="🚨 ANTI-SPAM ACTIVATED",
+            description=f"**{user.mention}** {action_text}!",
+            color=discord.Color.orange()
+        )
+        
+        if spam_type == "SLOW":
+            warning_embed.add_field(name="Rate limit", value="Sustained message flooding was detected.", inline=False)
+        
+        warning_msg = await message.channel.send(embed=warning_embed)
+        
+        await asyncio.sleep(8)
+        try:
+            await warning_msg.delete()
+        except:
+            pass
+        
+    except Exception as e:
+        print(f"Error handling spam: {e}")
+
+# Security-bot protection and kick monitoring
+@bot.event
+async def on_member_remove(member):
+    try:
+        if not bot.user:
+            return
+
+        if member.id == bot.user.id:
+            print(f"Security bot was removed from {member.guild.name}.")
+            entry = await get_recent_audit_entry(
+                member.guild, discord.AuditLogAction.kick, member.id
+            )
+            if not entry or entry.user.bot:
+                return
+            actor = entry.user
+            bot_member = member.guild.me
+            trusted = (
+                security.is_trusted_user(actor.id, member.guild.id)
+                or security.is_server_owner(actor, member.guild)
+            )
+            if not trusted and bot_member and bot_member.guild_permissions.kick_members:
+                await actor.kick(reason="ShieldCore: Unauthorized removal of the security bot")
+            return
+
+        entry = await get_recent_audit_entry(
+            member.guild, discord.AuditLogAction.kick, member.id
+        )
+        if not entry or entry.user.bot:
+            return
+        actor = entry.user
+        is_trusted = (
+            security.is_trusted_user(actor.id, member.guild.id)
+            or security.is_server_owner(actor, member.guild)
+        )
+        if is_trusted:
+            return
+        await track_user_action(member.guild.id, actor.id, "kick_members")
+        if await detect_nuke_activity(member.guild.id, actor.id):
+            await take_nuke_action(actor, member.guild, "kick_members")
+    except discord.HTTPException as error:
+        print(f"Could not inspect member removal: {error}")
+
+@bot.event
+async def on_guild_remove(guild):
+    print(f"ℹ️ Bot left guild: {guild.name} ({guild.id})")
+
+
+# Anti-bot protection
+@bot.event
+async def on_member_join(member):
+    if not ANTI_BOT_SYSTEM:
+        return
+    
+    server_anti_bot = security.get_server_anti_bot_status(member.guild.id)
+    if not server_anti_bot:
+        return
+    
+    is_approved = security.is_approved_bot(member.id, member.guild.id)
+    
+    if member.bot and not is_approved and member.id != bot.user.id:
+        try:
+            await member.kick(reason="ShieldCore: Unapproved bot")
+            print(f"✅ Kicked unapproved bot from {member.guild.name}: {member.name}")
+            
+            entry = await get_recent_audit_entry(
+                member.guild, discord.AuditLogAction.bot_add, member.id
+            )
+            if entry and not entry.user.bot:
+                adder = entry.user
+                try:
+                    await adder.send(security.get_bot_kick_dm())
+                except discord.HTTPException:
+                    pass
+
+                is_whitelisted = (
+                    security.is_trusted_user(adder.id, member.guild.id)
+                    or security.is_server_owner(adder, member.guild)
+                )
+                if not is_whitelisted:
+                    try:
+                        await adder.kick(reason="ShieldCore: Added an unapproved bot")
+                    except discord.HTTPException as error:
+                        print(f"Could not remove the user who added an unapproved bot: {error}")
+                    
+        except discord.HTTPException as error:
+            print(f"Anti-bot enforcement failed: {error}")
+
+# Anti-nuke monitoring
+@bot.event
+async def on_guild_channel_create(channel):
+    await inspect_nuke_audit(
+        channel.guild, discord.AuditLogAction.channel_create, channel.id, "channel_create"
+    )
+
+@bot.event
+async def on_guild_channel_delete(channel):
+    await inspect_nuke_audit(
+        channel.guild, discord.AuditLogAction.channel_delete, channel.id, "channel_delete"
+    )
+
+
+@bot.event
+async def on_guild_role_create(role):
+    await inspect_nuke_audit(role.guild, discord.AuditLogAction.role_create, role.id, "role_create")
+
+
+@bot.event
+async def on_guild_role_delete(role):
+    await inspect_nuke_audit(role.guild, discord.AuditLogAction.role_delete, role.id, "role_delete")
+
+@bot.event
+async def on_member_ban(guild, user):
+    try:
+        entry = await get_recent_audit_entry(guild, discord.AuditLogAction.ban, user.id)
+        if not entry:
+            return
+        banner = entry.user
+        
+        if not banner.bot:
+            await inspect_nuke_audit(guild, discord.AuditLogAction.ban, user.id, "ban_members")
+                
+    except discord.HTTPException as error:
+        print(f"Could not inspect ban activity: {error}")
+
+async def get_recent_audit_entry(guild, action, target_id, max_age=10):
+    """Return a recent audit entry that matches the event target."""
+    async for entry in guild.audit_logs(limit=10, action=action):
+        if not entry.target or entry.target.id != target_id:
+            continue
+        age = (datetime.datetime.now(datetime.UTC) - entry.created_at).total_seconds()
+        if 0 <= age <= max_age:
+            return entry
+    return None
+
+
+async def inspect_nuke_audit(guild, audit_action, target_id, action_type):
+    try:
+        entry = await get_recent_audit_entry(guild, audit_action, target_id)
+        if not entry or entry.user.bot:
+            return
+        if (
+            security.is_trusted_user(entry.user.id, guild.id)
+            or security.is_server_owner(entry.user, guild)
+        ):
+            return
+        await track_user_action(guild.id, entry.user.id, action_type)
+        if await detect_nuke_activity(guild.id, entry.user.id):
+            await take_nuke_action(entry.user, guild, action_type)
+    except discord.HTTPException as error:
+        print(f"Could not inspect {action_type} activity: {error}")
+
+
+async def track_user_action(guild_id, user_id, action_type):
+    current_time = time.monotonic()
+    cache_key = (guild_id, user_id)
+    
+    if cache_key not in ACTION_CACHE:
+        ACTION_CACHE[cache_key] = {name: [] for name in NUKE_LIMITS}
+    
+    if action_type not in ACTION_CACHE[cache_key]:
+        ACTION_CACHE[cache_key][action_type] = []
+
+    for tracked_action, timestamps in ACTION_CACHE[cache_key].items():
+        ACTION_CACHE[cache_key][tracked_action] = [
+            timestamp for timestamp in timestamps if current_time - timestamp <= 60
+        ]
+    ACTION_CACHE[cache_key][action_type].append(current_time)
+
+    if len(ACTION_CACHE) > SPAM_CACHE_MAX_ENTRIES:
+        for cached_key, actions in list(ACTION_CACHE.items()):
+            if not any(actions.values()):
+                ACTION_CACHE.pop(cached_key, None)
+                NUKE_ACTION_COOLDOWNS.pop(cached_key, None)
+
+async def detect_nuke_activity(guild_id, user_id):
+    cache_key = (guild_id, user_id)
+    
+    if cache_key not in ACTION_CACHE:
+        return False
+    
+    for action_type, limit in NUKE_LIMITS.items():
+        if action_type in ACTION_CACHE[cache_key]:
+            if len(ACTION_CACHE[cache_key][action_type]) >= limit:
+                print(f"Potential destructive activity detected for user {user_id}: {action_type}")
+                return True
+    
+    return False
+
+async def take_nuke_action(user, guild, action_type):
+    cooldown_key = (guild.id, user.id)
+    now = time.monotonic()
+    if NUKE_ACTION_COOLDOWNS.get(cooldown_key, 0) > now:
+        return
+    NUKE_ACTION_COOLDOWNS[cooldown_key] = now + 60
+
+    try:
+        bot_member = guild.me
+        if not bot_member:
+            return
+
+        if bot_member.guild_permissions.ban_members:
+            await guild.ban(user, reason=f"ShieldCore: Destructive activity detected - {action_type}")
+            result = "BANNED"
+            color = discord.Color.red()
+        elif bot_member.guild_permissions.kick_members:
+            await guild.kick(user, reason=f"ShieldCore: Destructive activity detected - {action_type}")
+            result = "KICKED (ban permission unavailable)"
+            color = discord.Color.orange()
+        else:
+            await log_security_event(
+                guild,
+                "⚠️ DESTRUCTIVE ACTIVITY DETECTED",
+                f"**User:** {user.mention}\n**Action:** {action_type}\n**Result:** No moderation permission available",
+                discord.Color.orange(),
+            )
+            return
+        
+        try:
+            await user.send("Your account was banned after automated security detected destructive activity.")
+        except:
+            pass
+        
+        await log_security_event(
+            guild,
+            "⚡ ANTI-NUKE ACTIVATED",
+            f"**User:** {user.mention}\n**Action:** {action_type}\n**Result:** **{result}**",
+            color
+        )
+    except discord.HTTPException as error:
+        await log_security_event(
+            guild,
+            "⚠️ DESTRUCTIVE ACTIVITY DETECTED",
+            f"**User:** {user.mention}\n**Action:** {action_type}\n**Moderation failed:** {error}",
+            discord.Color.orange(),
+        )
+
+async def log_security_event(guild, title, description, color):
+    try:
+        logs_channel = discord.utils.get(guild.text_channels, name="shieldcore-logs")
+        if not logs_channel:
+            for channel in guild.text_channels:
+                if channel.permissions_for(guild.me).send_messages:
+                    logs_channel = channel
+                    break
+        
+        if logs_channel:
+            embed = discord.Embed(
+                title=title,
+                description=description,
+                color=color,
+                timestamp=datetime.datetime.now(datetime.UTC)
+            )
+            await logs_channel.send(embed=embed)
+    except:
+        pass
+
+# PUBLIC COMMANDS (same as before)
+@bot.command(name='sc.help')
+async def shieldcore_help(ctx):
+    is_owner = security.is_owner(ctx.author.id)
+    is_server_owner = bool(ctx.guild and security.is_server_owner(ctx.author, ctx.guild))
+    
+    embed = discord.Embed(
+        title="🛡️ ShieldCore Security",
+        description="Automated server protection and moderation.",
+        color=discord.Color.blue()
+    )
+    
+    public_cmds = [
+        "`!sc.help` - Show this command list",
+        "`!sc.ping` - Check response latency",
+        "`!sc.status` - View security status",
+        "`!sc.serverinfo` - View server information",
+        "`!sc.botinfo` - View bot information",
+        "`!sc.whitelisted` - View trusted users",
+        "`!sc.approvedbots` - View approved bots",
+        "`!sc.permissions` - Check bot permissions"
+    ]
+    
+    embed.add_field(
+        name="👥 PUBLIC COMMANDS",
+        value="\n".join(public_cmds),
+        inline=False
+    )
+    
+    if ctx.guild and ctx.author.guild_permissions.administrator:
+        admin_cmds = [
+            "`!sc.clean <amount>` - Delete recent messages",
+            "`!sc.cleanuser @user <amount>` - Delete a user's recent messages",
+            "`!sc.lockdown` - Remove administrator roles from untrusted members",
+            "`!sc.scan` - Scan server security settings"
+        ]
+        
+        embed.add_field(
+            name="🔧 ADMIN COMMANDS",
+            value="\n".join(admin_cmds),
+            inline=False
+        )
+
+    if is_server_owner:
+        owner_cmds = [
+            "`!sc.whitelist @user` - Add a trusted user",
+            "`!sc.unwhitelist @user` - Remove a trusted user",
+            "`!sc.approvebot @bot` - Approve a bot",
+            "`!sc.emergency` - Remove unapproved bots",
+            "`!sc.setup` - Create security channels",
+            "`!sc.antibot on/off` - Configure bot protection",
+            "`!sc.backup` - Save a server snapshot"
+        ]
+        
+        embed.add_field(
+            name="👑 SERVER OWNER COMMANDS", 
+            value="\n".join(owner_cmds),
+            inline=False
+        )
+    
+    if is_owner:
+        owner_commands = [
+            "`!sc.allguilds` - View connected servers"
+        ]
+        embed.add_field(
+            name="BOT OWNER COMMANDS",
+            value="\n".join(owner_commands),
+            inline=False
+        )
+    await ctx.send(embed=embed)
+
+@bot.command(name='sc.ping')
+async def shieldcore_ping(ctx):
+    latency = round(bot.latency * 1000)
+    status = "Excellent" if latency < 100 else "Good" if latency < 200 else "Slow"
+    
+    embed = discord.Embed(
+        title="🏓 Pong!",
+        description=f"**Latency:** `{latency}ms` - **{status}**",
+        color=discord.Color.green()
+    )
+    embed.set_footer(text="Latency is measured in milliseconds.")
+    await ctx.send(embed=embed)
+
+@bot.command(name='sc.status')
+@commands.guild_only()
+async def shieldcore_status(ctx):
+    guild = ctx.guild
+    
+    embed = discord.Embed(
+        title="🛡️ Security Status",
+        description="Automated protections are monitoring this server.",
+        color=discord.Color.green(),
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    
+    server_whitelist = security.get_server_whitelist(guild.id)
+    server_approved = security.get_server_approved_bots(guild.id)
+    server_anti_bot = security.get_server_anti_bot_status(guild.id)
+    
+    embed.add_field(name="✅ Server Whitelist", value=len(server_whitelist), inline=True)
+    embed.add_field(name="🤖 Server Bots", value=len(server_approved), inline=True)
+    embed.add_field(name="👥 Members", value=guild.member_count, inline=True)
+    embed.add_field(name="🛡️ Anti-Spam", value="ACTIVE 🟢", inline=True)
+    embed.add_field(name="🛡️ Rate Limit Shield", value="ACTIVE 🟢", inline=True)
+    embed.add_field(name="🗣️ Profanity Filter", value="ACTIVE 🟢", inline=True)
+    embed.add_field(name="🚫 Anti-Bot", value="🟢 ON" if server_anti_bot else "🔴 OFF", inline=True)
+    embed.add_field(name="⚡ Anti-Nuke", value="ACTIVE 🟢", inline=True)
+    embed.add_field(name="⚡ Response", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    
+    embed.set_footer(text="Security monitoring status")
+    await ctx.send(embed=embed)
+
+@bot.command(name='sc.serverinfo')
+@commands.guild_only()
+async def shieldcore_serverinfo(ctx):
+    guild = ctx.guild
+    
+    embed = discord.Embed(
+        title=f"📊 {guild.name}",
+        color=discord.Color.green()
+    )
+    
+    embed.add_field(name="👑 Owner", value=f"<@{guild.owner_id}>", inline=True)
+    embed.add_field(name="📅 Created", value=guild.created_at.strftime("%d %b %Y"), inline=True)
+    embed.add_field(name="👥 Members", value=guild.member_count, inline=True)
+    embed.add_field(name="📁 Channels", value=len(guild.channels), inline=True)
+    embed.add_field(name="🛡️ Roles", value=len(guild.roles), inline=True)
+    embed.add_field(name="🚀 Boost", value=guild.premium_tier, inline=True)
+    
+    if guild.icon:
+        embed.set_thumbnail(url=guild.icon.url)
+    
+    embed.set_footer(text="Protected by ShieldCore")
+    await ctx.send(embed=embed)
+
+@bot.command(name='sc.botinfo')
+async def shieldcore_botinfo(ctx):
+    embed = discord.Embed(
+        title="🤖 ShieldCore Security Bot",
+        color=discord.Color.blue()
+    )
+    
+    embed.add_field(name="🛡️ Protection", value="Active", inline=True)
+    embed.add_field(name="📊 Servers", value=len(bot.guilds), inline=True)
+    embed.add_field(name="⚡ Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
+    embed.add_field(name="🔧 Version", value="2.1", inline=True)
+    embed.add_field(name="📝 Prefix", value="!sc.", inline=True)
+    
+    embed.set_footer(text="Automated server protection")
+    await ctx.send(embed=embed)
+
+# ADMIN COMMANDS
+@bot.command(name='sc.clean')
+@has_manage_messages_perm()
+async def shieldcore_clean(ctx, amount: int = 50):
+    if amount > 100:
+        await ctx.send("❌ Maximum 100 messages.", delete_after=10)
+        return
+    
+    if amount < 1:
+        await ctx.send("❌ Specify number 1-100.", delete_after=10)
+        return
+    
+    try:
+        await ctx.message.delete()
+    except:
+        pass
+    
+    deleted = await ctx.channel.purge(limit=amount)
+    msg = await ctx.send(f"✅ Deleted {len(deleted)} messages. 🧹")
+    await asyncio.sleep(3)
+    await msg.delete()
+
+@bot.command(name='sc.cleanuser')
+@has_manage_messages_perm()
+async def shieldcore_cleanuser(ctx, user: discord.Member, amount: int = 50):
+    if amount > 100:
+        await ctx.send("❌ Maximum 100 messages.", delete_after=10)
+        return
+
+    if amount < 1:
+        await ctx.send("❌ Please specify a number from 1 to 100.", delete_after=10)
+        return
+    
+    try:
+        await ctx.message.delete()
+    except:
+        pass
+    
+    def is_user_message(m):
+        return m.author.id == user.id
+    
+    deleted = await ctx.channel.purge(limit=amount, check=is_user_message)
+    msg = await ctx.send(f"✅ Deleted {len(deleted)} messages from {user.mention}. 👤")
+    await asyncio.sleep(3)
+    await msg.delete()
+
+@bot.command(name='sc.lockdown')
+@has_admin_perms()
+async def shieldcore_lockdown(ctx):
+    server_whitelist = security.get_server_whitelist(ctx.guild.id)
+    all_whitelisted = set(server_whitelist + [ctx.guild.owner_id])
+    if OWNER_ID:
+        all_whitelisted.add(OWNER_ID)
+    affected = 0
+    
+    for member in ctx.guild.members:
+        if member.id not in all_whitelisted:
+            for role in member.roles:
+                if role.permissions.administrator:
+                    try:
+                        await member.remove_roles(role)
+                        affected += 1
+                    except:
+                        continue
+    
+    embed = discord.Embed(
+        title="🔒 LOCKDOWN ACTIVATED",
+        description=f"Removed admin from {affected} non-whitelisted members",
+        color=discord.Color.red()
+    )
+    embed.set_footer(text="Security Level: MAXIMUM")
+    await ctx.send(embed=embed)
+
+# SERVER OWNER COMMANDS
+@bot.command(name='sc.whitelist')
+@is_server_owner_only()
+async def shieldcore_whitelist(ctx, user: discord.User):
+    if security.add_to_server_whitelist(ctx.guild.id, user.id):
+        embed = discord.Embed(
+            title="✅ SERVER WHITELISTED",
+            description=f"{user.mention} added to server whitelist",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(f"ℹ️ {user.mention} already whitelisted.")
+
+@bot.command(name='sc.unwhitelist')
+@is_server_owner_only()
+async def shieldcore_unwhitelist(ctx, user: discord.User):
+    if user.id == ctx.guild.owner_id and not security.is_owner(ctx.author.id):
+        await ctx.send("❌ Cannot remove server owner.")
+        return
+    
+    if security.remove_from_server_whitelist(ctx.guild.id, user.id):
+        embed = discord.Embed(
+            title="✅ REMOVED FROM WHITELIST",
+            description=f"{user.mention} removed from server whitelist",
+            color=discord.Color.orange()
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(f"❌ {user.mention} not in whitelist.")
+
+@bot.command(name='sc.approvebot')
+@is_server_owner_only()
+async def shieldcore_approvebot(ctx, bot_user: discord.User):
+    if not bot_user.bot:
+        await ctx.send("❌ For bots only.")
+        return
+    
+    if security.add_server_approved_bot(ctx.guild.id, bot_user.id):
+        embed = discord.Embed(
+            title="✅ BOT APPROVED",
+            description=f"{bot_user.mention} approved for this server",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(f"ℹ️ {bot_user.mention} already approved.")
+
+@bot.command(name='sc.emergency')
+@is_server_owner_only()
+async def shieldcore_emergency(ctx):
+    server_approved = security.get_server_approved_bots(ctx.guild.id)
+    all_approved = set(server_approved)
+    removed = 0
+    
+    for member in ctx.guild.members:
+        if member.bot and member.id not in all_approved and member != bot.user:
+            try:
+                await member.kick(reason="Emergency - unapproved bot")
+                removed += 1
+            except:
+                continue
+    
+    embed = discord.Embed(
+        title="🚨 EMERGENCY MODE",
+        description=f"Removed {removed} unapproved bots",
+        color=discord.Color.red()
+    )
+    await ctx.send(embed=embed)
+
+@bot.command(name='sc.setup')
+@is_server_owner_only()
+async def shieldcore_setup(ctx):
+    try:
+        commands_channel = discord.utils.get(ctx.guild.text_channels, name="shieldcore-commands")
+        if not commands_channel:
+            commands_channel = await ctx.guild.create_text_channel("shieldcore-commands")
+        
+        logs_channel = discord.utils.get(ctx.guild.text_channels, name="shieldcore-logs")
+        if not logs_channel:
+            logs_channel = await ctx.guild.create_text_channel("shieldcore-logs")
+            await logs_channel.set_permissions(ctx.guild.default_role, view_channel=False)
+        
+        embed = discord.Embed(
+            title="✅ SETUP COMPLETE",
+            description="Security channels created",
+            color=discord.Color.green()
+        )
+        embed.add_field(name="Commands", value=commands_channel.mention, inline=True)
+        embed.add_field(name="Logs", value=logs_channel.mention, inline=True)
+        
+        await ctx.send(embed=embed)
+        
+    except Exception as e:
+        print(f"Security channel setup failed in guild {ctx.guild.id}: {e}")
+        await ctx.send("❌ Setup failed. Check the bot's channel permissions and try again.")
+
+@bot.command(name='sc.antibot')
+@is_server_owner_only()
+async def shieldcore_antibot(ctx, status: str = None):
+    if status is None:
+        current = security.get_server_anti_bot_status(ctx.guild.id)
+        status_text = "🟢 ENABLED" if current else "🔴 DISABLED"
+        embed = discord.Embed(
+            title="🤖 Anti-Bot Status",
+            description=f"Current: **{status_text}**",
+            color=discord.Color.green() if current else discord.Color.red()
+        )
+        embed.add_field(name="Usage", value="`!sc.antibot on` or `!sc.antibot off`", inline=False)
+        await ctx.send(embed=embed)
+        return
+    
+    if status.lower() in ['on', 'enable', 'true', 'yes']:
+        security.set_server_anti_bot_status(ctx.guild.id, True)
+        embed = discord.Embed(
+            title="✅ ANTI-BOT ENABLED",
+            description="Bot protection ACTIVE",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+        
+    elif status.lower() in ['off', 'disable', 'false', 'no']:
+        security.set_server_anti_bot_status(ctx.guild.id, False)
+        embed = discord.Embed(
+            title="🔴 ANTI-BOT DISABLED",
+            description="Bot protection INACTIVE",
+            color=discord.Color.red()
+        )
+        await ctx.send(embed=embed)
+        
+    else:
+        await ctx.send("❌ Use `on` or `off`")
+
+# Bot owner commands
+@bot.command(name='sc.allguilds')
+@is_owner_only()
+async def shieldcore_allguilds(ctx):
+    embed = discord.Embed(
+        title="📊 ALL SERVERS",
+        description="Connected server overview.",
+        color=discord.Color.blue()
+    )
+    
+    for guild in bot.guilds[:23]:
+        server_anti_bot = security.get_server_anti_bot_status(guild.id)
+        
+        embed.add_field(
+            name=f"🛡️ {guild.name}",
+            value=f"**Owner:** <@{guild.owner_id}>\n**Members:** {guild.member_count}\n**Anti-Bot:** {'🟢 ON' if server_anti_bot else '🔴 OFF'}",
+            inline=False
+        )
+
+    if len(bot.guilds) > 23:
+        embed.add_field(
+            name="Additional servers",
+            value=f"{len(bot.guilds) - 23} more server(s) are not shown.",
+            inline=False,
+        )
+    
+    embed.set_footer(text=f"Total connected servers: {len(bot.guilds)}")
+    await ctx.send(embed=embed)
+
+
+# Additional public commands
+
+@bot.command(name='sc.whitelisted')
+@commands.guild_only()
+async def shieldcore_whitelisted(ctx):
+    """Show only users trusted in the current server."""
+    guild = ctx.guild
+    server_whitelist = security.get_server_whitelist(guild.id)
+    server_users = []
+
+    for user_id in server_whitelist:
+        try:
+            user = guild.get_member(user_id) or await bot.fetch_user(user_id)
+            server_users.append(f"🛡️ {user.mention}")
+        except discord.HTTPException:
+            server_users.append(f"🛡️ <@{user_id}>")
+
+    embed = discord.Embed(
+        title="✅ WHITELISTED USERS",
+        description=f"**Server:** {guild.name}",
+        color=discord.Color.green()
+    )
+    if server_users:
+        embed.add_field(
+            name=f"🛡️ SERVER WHITELIST ({len(server_users)})",
+            value="\n".join(server_users[:20]),
+            inline=False
+        )
+    else:
+        embed.description = f"**Server:** {guild.name}\nNo server-specific whitelisted users."
+
+    embed.set_footer(text="Whitelist applies only to this server")
+    await ctx.send(embed=embed)
+
+@bot.command(name='sc.approvedbots')
+@commands.guild_only()
+async def shieldcore_approvedbots(ctx):
+    """Show bots approved or currently present in this server."""
+    guild = ctx.guild
+    server_bots_list = security.get_server_approved_bots(guild.id)
+    embed = discord.Embed(
+        title="🤖 APPROVED BOTS",
+        description=f"**Server:** {guild.name}",
+        color=discord.Color.blue()
+    )
+
+    approved_entries = []
+    for bot_id in server_bots_list:
+        bot_member = guild.get_member(bot_id)
+        approved_entries.append(
+            f"🛡️ {bot_member.mention if bot_member else f'<@{bot_id}>'}"
+        )
+    if approved_entries:
+        embed.add_field(
+            name=f"🛡️ SERVER APPROVED ({len(approved_entries)})",
+            value="\n".join(approved_entries[:20]),
+            inline=False
+        )
+    else:
+        embed.description += "\nNo server-specific approved bots are configured."
+
+    current_bots = [member for member in guild.members if member.bot]
+    if current_bots:
+        bot_list = []
+        for bot_member in current_bots[:15]:
+            if bot_member.id == bot.user.id:
+                status = "🛡️ SECURITY BOT"
+            elif bot_member.id in server_bots_list:
+                status = "✅ APPROVED HERE"
+            else:
+                status = "⚠️ NOT ON SERVER WHITELIST"
+            bot_list.append(f"{bot_member.mention} - {status}")
+        embed.add_field(
+            name=f"🤖 CURRENT BOTS ({len(current_bots)})",
+            value="\n".join(bot_list),
+            inline=False
+        )
+
+    embed.set_footer(text="Approval status is scoped to this server")
+    await ctx.send(embed=embed)
+
+@bot.command(name='sc.permissions')
+@commands.guild_only()
+async def shieldcore_permissions(ctx):
+    """Show bot permissions"""
+    guild = ctx.guild
+    bot_member = guild.get_member(bot.user.id)
+    
+    if not bot_member:
+        await ctx.send("❌ Bot not found in server.")
+        return
+    
+    permissions = bot_member.guild_permissions
+    
+    embed = discord.Embed(
+        title="🔐 BOT PERMISSIONS",
+        description=f"**Server:** {guild.name}",
+        color=discord.Color.purple()
+    )
+    
+    # Critical permissions
+    critical_perms = [
+        ("Administrator", permissions.administrator, "🟢", "🔴"),
+        ("Kick Members", permissions.kick_members, "👢", "❌"),
+        ("Ban Members", permissions.ban_members, "🔨", "❌"),
+        ("Manage Roles", permissions.manage_roles, "👑", "❌"),
+        ("Manage Channels", permissions.manage_channels, "📁", "❌"),
+        ("Manage Messages", permissions.manage_messages, "🗑️", "❌"),
+        ("Moderate Members", permissions.moderate_members, "⏰", "❌"),
+    ]
+    
+    critical_text = []
+    for perm_name, has_perm, yes_emoji, no_emoji in critical_perms:
+        emoji = yes_emoji if has_perm else no_emoji
+        critical_text.append(f"{emoji} **{perm_name}**: {'✅ Yes' if has_perm else '❌ No'}")
+    
+    embed.add_field(
+        name="🔐 CRITICAL PERMISSIONS",
+        value="\n".join(critical_text),
+        inline=False
+    )
+    
+    # Important permissions
+    important_perms = [
+        ("View Audit Log", permissions.view_audit_log, "📜"),
+        ("Manage Webhooks", permissions.manage_webhooks, "🪝"),
+        ("View Channels", permissions.view_channel, "👁️"),
+        ("Send Messages", permissions.send_messages, "💬"),
+        ("Embed Links", permissions.embed_links, "🔗"),
+        ("Attach Files", permissions.attach_files, "📎"),
+        ("Read Message History", permissions.read_message_history, "📖"),
+        ("Use External Emojis", permissions.use_external_emojis, "😄"),
+    ]
+    
+    important_text = []
+    for perm_name, has_perm, emoji in important_perms:
+        status = "✅" if has_perm else "❌"
+        important_text.append(f"{emoji} {perm_name}: {status}")
+    
+    # Split into two columns
+    mid = len(important_text) // 2
+    col1 = "\n".join(important_text[:mid])
+    col2 = "\n".join(important_text[mid:])
+    
+    embed.add_field(name="📋 IMPORTANT PERMS", value=col1, inline=True)
+    embed.add_field(name="📋 ADDITIONAL PERMISSIONS", value=col2, inline=True)
+    
+    # Permission summary
+    total_critical = sum(1 for _, has_perm, _, _ in critical_perms if has_perm)
+    total_important = sum(1 for _, has_perm, _ in important_perms if has_perm)
+    
+    security_level = "MAXIMUM 🔥" if total_critical >= 6 else "HIGH 🟢" if total_critical >= 4 else "MEDIUM 🟡" if total_critical >= 2 else "LOW 🔴"
+    
+    embed.add_field(
+        name="📊 SECURITY SUMMARY",
+        value=f"**Level:** {security_level}\n"
+              f"**Critical:** {total_critical}/7 ✅\n"
+              f"**Important:** {total_important}/8 ✅\n"
+              f"**Bot Role:** {'Highest' if bot_member.top_role == max(guild.roles, key=lambda role: role.position) else 'Not Highest'}",
+        inline=False
+    )
+    
+    # Recommendations
+    missing_critical = [name for name, has_perm, _, _ in critical_perms if not has_perm]
+    if missing_critical:
+        embed.add_field(
+            name="⚠️ RECOMMENDATIONS",
+            value=f"Missing: {', '.join(missing_critical[:3])}\n"
+                  "Grant only the permissions needed for the enabled security features.",
+            inline=False
+        )
+    
+    embed.set_footer(text="All permissions required for maximum security")
+    await ctx.send(embed=embed)
+
+# Administrative security scan
+@bot.command(name='sc.scan')
+@commands.guild_only()
+@has_admin_perms()
+async def shieldcore_scan(ctx):
+    """Scan server for potential threats"""
+    guild = ctx.guild
+    
+    # Start scan
+    scanning_msg = await ctx.send("🔍 **Scanning server for threats...**")
+    
+    embed = discord.Embed(
+        title="🛡️ SECURITY SCAN REPORT",
+        description=f"**Server:** {guild.name}",
+        color=discord.Color.orange(),
+        timestamp=datetime.datetime.now(datetime.UTC)
+    )
+    
+    # 1. Bot analysis
+    all_members = list(guild.members)
+    bots = [m for m in all_members if m.bot]
+    unapproved_bots = []
+    approved_bots = []
+    
+    for bot_member in bots:
+        if bot_member.id == bot.user.id:
+            approved_bots.append(f"🛡️ {bot_member.mention} (Security Bot)")
+        elif security.is_approved_bot(bot_member.id, guild.id):
+            approved_bots.append(f"✅ {bot_member.mention}")
+        else:
+            unapproved_bots.append(f"⚠️ {bot_member.mention}")
+    
+    # 2. Permission analysis
+    admin_users = []
+    untrusted_admins = []
+    for member in guild.members:
+        if member.guild_permissions.administrator and not member.bot:
+            if (
+                security.is_trusted_user(member.id, guild.id)
+                or member.id == guild.owner_id
+            ):
+                admin_users.append(f"✅ {member.mention} (Trusted)")
+            else:
+                admin_users.append(f"⚠️ {member.mention} (Untrusted)")
+    
+    # 3. Role analysis
+    dangerous_roles = []
+    for role in guild.roles:
+        if role.permissions.administrator and not role.is_bot_managed():
+            dangerous_roles.append(f"⚠️ @{role.name}")
+    
+    # 4. Channel analysis
+    unprotected_channels = []
+    for channel in guild.text_channels:
+        if isinstance(channel, discord.TextChannel):
+            everyone_perms = channel.overwrites_for(guild.default_role)
+            if everyone_perms.send_messages is not False:
+                unprotected_channels.append(f"#️⃣ {channel.name}")
+    
+    # Build report
+    embed.add_field(
+        name="🤖 BOT ANALYSIS",
+        value=f"**Total Bots:** {len(bots)}\n"
+              f"**Approved:** {len(approved_bots)}\n"
+              f"**Unapproved:** {len(unapproved_bots)}",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="👑 ADMIN ANALYSIS",
+        value=f"**Admin Users:** {len(admin_users)}\n"
+              f"**Owner:** <@{guild.owner_id}>",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🛡️ SECURITY STATUS",
+        value=f"**Anti-Bot:** {'🟢 ON' if security.get_server_anti_bot_status(guild.id) else '🔴 OFF'}\n"
+              f"**Whitelist:** {len(security.get_server_whitelist(guild.id))} users",
+        inline=True
+    )
+    
+    # Detailed findings
+    findings = []
+    
+    if unapproved_bots:
+        findings.append(f"⚠️ **{len(unapproved_bots)} unapproved bots** detected")
+    
+    if admin_users:
+        untrusted_admins = [a for a in admin_users if "⚠️" in a]
+        if untrusted_admins:
+            findings.append(f"⚠️ **{len(untrusted_admins)} untrusted admins**")
+    
+    if dangerous_roles:
+        findings.append(f"⚠️ **{len(dangerous_roles)} dangerous roles** with admin permissions")
+    
+    if unprotected_channels:
+        findings.append(f"⚠️ **{len(unprotected_channels)} channels** without @everyone send restriction")
+    
+    if findings:
+        embed.add_field(
+            name="🔍 FINDINGS",
+            value="\n".join(findings[:5]),  # Limit to 5 findings
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="✅ ALL CLEAR",
+            value="No immediate threats detected!",
+            inline=False
+        )
+    
+    # Recommendations
+    recommendations = []
+    
+    if len(unapproved_bots) > 0:
+        recommendations.append("• Run `!sc.emergency` to remove unapproved bots")
+    
+    if untrusted_admins:
+        recommendations.append("• Run `!sc.lockdown` to remove admin from untrusted users")
+    
+    if len(dangerous_roles) > 0:
+        recommendations.append("• Review roles with admin permissions")
+    
+    if not security.get_server_anti_bot_status(guild.id):
+        recommendations.append("• Enable anti-bot: `!sc.antibot on`")
+    
+    if recommendations:
+        embed.add_field(
+            name="💡 RECOMMENDATIONS",
+            value="\n".join(recommendations[:4]),
+            inline=False
+        )
+    
+    # Security score
+    score = 100
+    score -= len(unapproved_bots) * 15
+    score -= len(dangerous_roles) * 10
+    score -= len([a for a in admin_users if "⚠️" in a]) * 20
+    if not security.get_server_anti_bot_status(guild.id):
+        score -= 30
+    
+    score = max(0, min(100, score))
+    
+    if score >= 80:
+        security_level = "EXCELLENT 🟢"
+    elif score >= 60:
+        security_level = "GOOD 🟡"
+    elif score >= 40:
+        security_level = "MODERATE 🟠"
+    else:
+        security_level = "POOR 🔴"
+    
+    embed.add_field(
+        name="📊 SECURITY SCORE",
+        value=f"**{score}/100** - {security_level}",
+        inline=False
+    )
+    
+    embed.set_footer(text=f"Scan completed • {len(guild.members)} members")
+    
+    # Delete scanning message and send report
+    try:
+        await scanning_msg.delete()
+    except:
+        pass
+    
+    await ctx.send(embed=embed)
+
+# Server owner backup command
+@bot.command(name='sc.backup')
+@is_server_owner_only()
+async def shieldcore_backup(ctx):
+    """Create server backup"""
+    guild = ctx.guild
+    
+    # Create backup
+    await security.save_guild_backup(guild)
+    
+    embed = discord.Embed(
+        title="💾 BACKUP CREATED",
+        description=f"**Server:** {guild.name}",
+        color=discord.Color.green()
+    )
+    
+    backup_info = GUILD_BACKUPS.get(guild.id, {})
+    
+    embed.add_field(name="📁 Channels", value=len(backup_info.get('channels', [])), inline=True)
+    embed.add_field(name="🛡️ Roles", value=len(backup_info.get('roles', [])), inline=True)
+    embed.add_field(name="👑 Owner", value=f"<@{backup_info.get('owner_id', '')}>", inline=True)
+    
+    if 'created_at' in backup_info:
+        created = datetime.datetime.fromisoformat(backup_info['created_at'].replace('Z', '+00:00'))
+        embed.add_field(name="🕐 Created", value=created.strftime("%d %b %Y %H:%M"), inline=False)
+    
+    embed.add_field(
+        name="ℹ️ INFO",
+        value="Backup includes:\n• Channel structure\n• Role permissions\n• Bot settings\n• Security configuration",
+        inline=False
+    )
+    
+    embed.set_footer(text="Backup auto-saved on bot restart or emergency")
+    await ctx.send(embed=embed)
+    
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        return
+    if isinstance(error, commands.CheckFailure):
+        return
+    if isinstance(error, (commands.MissingRequiredArgument, commands.BadArgument)):
+        await ctx.send("❌ Invalid or missing arguments. Use `!sc.help` for command usage.", delete_after=10)
+        return
+    if isinstance(error, commands.BotMissingPermissions):
+        await ctx.send("❌ I do not have the permissions required for that action.", delete_after=10)
+        return
+
+    original_error = getattr(error, "original", error)
+    print(f"Command error in {ctx.command}: {original_error}")
+    if isinstance(original_error, discord.Forbidden):
+        response = "❌ Discord denied that action. Check the bot's permissions and role position."
+    else:
+        response = "❌ The command could not be completed. The error has been logged."
+    try:
+        await ctx.send(response, delete_after=10)
+    except discord.HTTPException:
+        pass
+
+if __name__ == "__main__":
+    if not BOT_TOKEN:
+        print("❌ BOT_TOKEN not found")
+        exit(1)
+    
+    print("🚀 Starting ShieldCore Security Bot")
+    print("🛡️ Anti-spam: ENABLED")
+    print("🛡️ Rate Limit Shield: ENABLED")
+    print("🤖 Anti-bot protection: ENABLED")
+    print("⚡ Anti-nuke monitoring: ENABLED")
+    print("🗣️ Profanity filter: ENABLED")
+    
+    try:
+        bot.run(BOT_TOKEN)
+    except Exception as e:
+        print(f"❌ Failed: {e}")
